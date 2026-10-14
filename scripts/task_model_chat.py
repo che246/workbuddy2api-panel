@@ -28,7 +28,8 @@ def main():
     ap = argparse.ArgumentParser(description="Model_chat_GLM5.2 任务")
     ap.add_argument("account", help="uid 前缀，或 ALL")
     ap.add_argument("--yes", action="store_true", help="确认执行写操作")
-    ap.add_argument("--prompt", default="hi，请回复一句话", help="发给 GLM-5.2 的提示词")
+    ap.add_argument("--prompt", default=None,
+                    help="发给 GLM-5.2 的提示词（缺省 = 随机算术题，每次不同）")
     a = ap.parse_args()
 
     prefixes = []

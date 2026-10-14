@@ -792,6 +792,8 @@ func runFirstBuddy(p *Panel, a *auth.Auth) (string, error) {
 }
 
 // runModelChat 完成 Model_chat_GLM5.2：accept → 真实对话 → 对齐模型上报。
+// 对话内容用 upstream.ProbeQuestion() 随机算术题（与夜猫子/桌面 chat 同一题源）：
+// 原硬编码 "hi，请回复一句话" 在同账号反复跑、多账号并发跑时请求体逐字相同。
 func runModelChat(p *Panel, a *auth.Auth) (string, error) {
 	const code, modelID, modelName = "Model_chat_GLM5.2", "glm-5.2", "GLM-5.2"
 	// 1. accept（报名；失败不阻塞——行为事件才是判据）
@@ -803,7 +805,7 @@ func runModelChat(p *Panel, a *auth.Auth) (string, error) {
 	body, _ := json.Marshal(map[string]any{
 		"model": modelID,
 		"messages": []map[string]any{
-			{"role": "user", "content": "hi，请回复一句话"},
+			{"role": "user", "content": upstream.ProbeQuestion()},
 		},
 		"stream": true,
 	})

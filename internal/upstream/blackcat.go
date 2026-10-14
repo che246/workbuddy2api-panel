@@ -40,14 +40,18 @@ func (c *Client) BlackcatNeed(a *auth.Auth) (int64, error) {
 	return 0, nil
 }
 
+// nightChatGap 夜猫子每轮对话之间的间隔：拉开节奏，避免 3 连击被上游判成机器。
+// 独立变量供测试缩短（生产固定 4s，与既有 billingRetryDelay 同款可替换点）。
+var nightChatGap = 4 * time.Second
+
 // RunNightChats 夜猫子：发 need 次 glm-5.2 真实对话（读干流）并上报事件链。
-// 返回成功次数。对话内容极短（1+1），消耗可忽略。
+// 返回成功次数。对话内容极短（ProbeQuestion 随机算术题，每次不同），消耗可忽略。
 func (c *Client) RunNightChats(a *auth.Auth, need int) (int64, error) {
 	var ok int64
 	for i := 0; i < need; i++ {
 		body, _ := json.Marshal(map[string]any{
 			"model":    "glm-5.2",
-			"messages": []map[string]any{{"role": "user", "content": "1+1等于几？直接回答。"}},
+			"messages": []map[string]any{{"role": "user", "content": ProbeQuestion()}},
 			"stream":   true,
 		})
 		rc, status, respBody, err := c.ChatStream(a, body, "", ChatMeta{})
@@ -63,7 +67,7 @@ func (c *Client) RunNightChats(a *auth.Auth, need int) (int64, error) {
 			return ok, fmt.Errorf("第 %d 次上报失败: %w", i+1, err)
 		}
 		ok++
-		time.Sleep(4 * time.Second)
+		time.Sleep(nightChatGap)
 	}
 	return ok, nil
 }

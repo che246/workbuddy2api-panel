@@ -10,7 +10,7 @@
   - accept : POST /v2/activity/growth/tasks/accept  {"task_codes":[code]}
   - claim  : POST /v2/activity/growth/tasks/reward/claim {"task_code":code}
 """
-import json, os, time, glob, urllib.request, urllib.error
+import json, os, time, glob, random, urllib.request, urllib.error
 
 AUTHS = "/root/workbuddy2api/auths"
 CHAT_BASE = "https://copilot.tencent.com"   # growth / tasks / buddy / streak / chat
@@ -182,13 +182,40 @@ def report_activity(auth, count=1, gap=1.05, model_id="deepseek-v4-flash",
     return out
 
 
-def chat_completion(auth, model_id="glm-5.2", prompt="hi", max_tokens=32,
+def probe_question():
+    """生成一道随机算术题（与 Go 侧 upstream.ProbeQuestion 同款形状/后缀）。
+
+    用途：Model_chat_GLM5.2 等「真实对话一次」的探活提示词。原先各处硬编码固定
+    文案（"hi，请回复一句话"），同账号反复跑、多账号并发跑时请求体逐字相同，
+    是天然的机器重复指纹。四种形状轮换：a+b / a-b / a×b / a+b-c，答案恒非负。
+
+    不出除法：答案可能非整数，模型容易展开思考、拉长回答，与「极短对话」相悖。
+    """
+    kind = random.randrange(4)
+    if kind == 0:
+        return f"{random.randint(10, 99)} + {random.randint(10, 99)} 等于几？直接回答。"
+    if kind == 1:
+        a = random.randint(11, 99)
+        b = random.randint(10, a - 1)   # 恒保 a > b，答案落在 [1, 89]
+        return f"{a} - {b} 等于几？直接回答。"
+    if kind == 2:
+        return f"{random.randint(2, 12)} × {random.randint(2, 12)} 等于几？直接回答。"
+    a, b = random.randint(10, 99), random.randint(10, 99)
+    c = random.randint(1, a + b - 1)    # 1 ≤ c ≤ a+b-1 ⇒ 答案落在 [1, a+b-1]
+    return f"{a} + {b} - {c} 等于几？直接回答。"
+
+
+def chat_completion(auth, model_id="glm-5.2", prompt=None, max_tokens=32,
                     timeout=60) -> tuple:
     """POST {chat}/v2/chat/completions 真实对话一次（stream:true）。
 
     服务端强制流式（payload.go 同款口径），这里逐行读 SSE 直到 done。
     返回 (status, first_content)。用于 Model_chat_GLM5.2 的“真实对话一次”。
+
+    prompt 缺省（None/空）时用 probe_question() 随机算术题——每次调用题面不同，
+    避免固定提示词成为重复指纹。
     """
+    prompt = prompt or probe_question()
     body = {"model": model_id, "messages": [{"role": "user", "content": prompt}],
             "stream": True, "max_tokens": max_tokens}
     hdr = {"Accept": "text/event-stream"}  # SSE
