@@ -1006,3 +1006,73 @@ process.stdout.write(JSON.stringify({
 			strings.TrimSpace(string(out)), want)
 	}
 }
+
+// TestAppJSAccountDeviceTokenCell 账号表「设备码」列：只显示有无 + 前几位（脱敏）。
+//
+// 钉住三件事：
+//  1. 行内 <td> 数 == 表头列数（10）——加列时漏改任一侧都会失败；
+//  2. 有 token → 渲染「前 4 位…」；无 token → 渲染「—」，且 tooltip 写明
+//     「本号未自带」不等于「出站不带该头」（还有 config 全局兜底两级）；
+//  3. 即便响应里混进了完整 device_token 字段，渲染器也不得把它写进 HTML——
+//     前端只认 prefix+len，原值在 pool 边界就已被截断（见 pool.deviceTokenHint）。
+func TestAppJSAccountDeviceTokenCell(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; account device token cell test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function renderAccounts');
+const end = src.indexOf('// renderModelLocks');
+if (start < 0 || end < 0 || end < start) throw new Error('renderAccounts region not found');
+const sinks = {};
+const mk = id => (sinks[id] = { innerHTML: '', textContent: '' });
+const ctx = {
+  esc: s => String(s == null ? '' : s),
+  dur: () => '1m',
+  ago: () => '刚刚',
+  rateLimitRowsHtml: () => '',
+  formatTokenCount: v => String(v == null ? 0 : v),
+  formatLatency: () => '1ms',
+  formatRate: () => '1tok/s',
+  $: id => (sinks[id] || mk(id)),
+  Date, Math, Number, String, Array, Object, isNaN,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderAccounts = renderAccounts;', ctx);
+ctx.renderAccounts([
+  // 第二条故意带上完整的 device_token：模拟「后端哪天误透传了原值」，
+  // 渲染器仍不得把它写进 HTML。
+  { uid: 'u-with', nickname: '有码', credits: 10,
+    device_token_prefix: 'wb2a', device_token_len: 64, device_token: 'SECRET-FULL-TOKEN' },
+  { uid: 'u-without', nickname: '无码', credits: 10 },
+]);
+const html = sinks['accBody'].innerHTML;
+const rows = (html.match(/<tr/g) || []).length;
+const tds = (html.match(/<td/g) || []).length;
+process.stdout.write(JSON.stringify({
+  rows: rows,
+  tdsPerRow: rows ? tds / rows : 0,
+  prefix: html.includes('wb2a…'),
+  tipSet: html.includes('本号自带 X-Device-Token'),
+  tipNone: html.includes('本号未自带 X-Device-Token'),
+  leaked: html.includes('SECRET-FULL-TOKEN'),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "devtok-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("device token cell node test failed: %v\n%s", err, out)
+	}
+	const wantDev = `{"rows":2,"tdsPerRow":10,"prefix":true,"tipSet":true,"tipNone":true,"leaked":false}`
+	if strings.TrimSpace(string(out)) != wantDev {
+		t.Fatalf("device token cell=%s\nwant %s", strings.TrimSpace(string(out)), wantDev)
+	}
+}

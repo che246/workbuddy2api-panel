@@ -537,10 +537,36 @@ func (p *Pool) List() []Status {
 	}
 	return out
 }
+
+// deviceTokenHint 生成本号设备风控 token（X-Device-Token）的脱敏摘要：
+// 前 4 个字符 + 总字符数。空 token 返回 ("", 0)。
+//
+// 完整 token 绝不离开本函数——Status 是对外的脱敏视图（见 Status 头注），
+// 面板是运维视图，原值等于把设备指纹交出去。在 pool 边界截断，前端拿不到原值，
+// 也就不存在「前端忘了脱敏」这条泄漏面。
+//
+// 按 rune 截取而非 byte：token 理论上是 ASCII，但按 rune 走不会在多字节字符上
+// 切出半个字（截断位置一旦落进多字节序列，面板会显示乱码）。
+func deviceTokenHint(tok string) (prefix string, n int) {
+	if tok == "" {
+		return "", 0
+	}
+	rs := []rune(tok)
+	n = len(rs)
+	if n > 4 {
+		rs = rs[:4]
+	}
+	return string(rs), n
+}
+
 func (p *Pool) statusOf(uid string, e *entry) Status {
 	now := time.Now()
+	devPrefix, devLen := deviceTokenHint(e.a.DeviceToken)
 	st := Status{
 		UID: uid,
+		// 设备风控 token 的脱敏摘要（有无 + 前 4 位 + 长度），见 deviceTokenHint。
+		DeviceTokenPrefix: devPrefix,
+		DeviceTokenLen:    devLen,
 		// 限额台账（issue #36）：仅「带解析时间 6004 的模型级软冷却」仍在生效时非空，
 		// 每模型一行（modelCooldowns 内未到期的条目），多模型同时限流全部展示。
 		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，

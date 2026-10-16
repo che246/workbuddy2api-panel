@@ -676,7 +676,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <table class="acc">
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
-            <th>账号</th><th>状态</th><th>积分</th>
+            <th>账号</th>
+            <th title="本号自带的 X-Device-Token（auth 文件的 device_token 键），仅显示有无与前几位。显示「—」只代表本号没自带，出站仍可能由 config upstream.device_token / device_token_file 全局兜底">设备码</th>
+            <th>状态</th><th>积分</th>
             <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>

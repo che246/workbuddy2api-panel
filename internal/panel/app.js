@@ -370,7 +370,7 @@ setTimeout(() => {
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
@@ -414,6 +414,18 @@ function renderAccounts(list) {
         '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
     }
     const frozen = s.disabled || cool > 0;
+    // 设备码（X-Device-Token）：只显示有无 + 前几位——前缀与长度由服务端算好
+    // （pool.deviceTokenHint），前端拿不到原值，也就不存在「前端忘了脱敏」这条面。
+    // 显示「—」只代表**本号没自带**，出站仍可能由 config upstream.device_token /
+    // device_token_file 全局兜底，故 tooltip 里写明这一层，避免误判成「没发这个头」。
+    const dtLen = s.device_token_len || 0;
+    const dtPfx = s.device_token_prefix || '';
+    const devTip = dtLen
+      ? '本号自带 X-Device-Token：共 ' + dtLen + ' 位，此处只显示前 ' + dtPfx.length + ' 位（脱敏）'
+      : '本号未自带 X-Device-Token（auth 文件的 device_token 键为空）；出站仍可能由 config upstream.device_token / device_token_file 全局兜底';
+    const dev = dtLen
+      ? '<span class="clip ip" title="' + esc(devTip) + '">' + esc(dtPfx + (dtLen > dtPfx.length ? '…' : '')) + '</span>'
+      : '<span style="color:var(--ink-3)" title="' + esc(devTip) + '">—</span>';
     const tu = s.token_usage || {};
     const req = tu.request_count || 0;
     const totalTok = formatTokenCount(tu.total_tokens);
@@ -424,6 +436,7 @@ function renderAccounts(list) {
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td>' + dev + '</td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
