@@ -1392,6 +1392,98 @@ func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
 	}
 }
 
+// TestContentBlockedPersistentRotatesToAnotherAccount 降级重试后**仍被拦** → 判定渠道校验 → 换号重试。
+//
+// 背景（2026-10-16 线上）：code 11-128 的旧措辞 "Illegal API invocation from an unapproved
+// channel" 与内容策略文案共用同一个码，被 contentBlockedMarkers 先命中归为 ErrContentBlocked，
+// 于是走「降级重写提示词 + 原地重试」。但该错误实为**渠道校验**（displayTips: "not sent from
+// an official client"），与提示词无关——线上同一次请求内换号就能过：
+//
+//	22:58:04 fucai18899 200 ｜ 22:58:22 che246 400 ｜ 22:58:50 fucssw 200
+//
+// 三次请求上下文规模相同（约 22 万 token），差异只在账号。而原地重试必然再撞：线上三次降级
+// 重试全部落在**同一个**账号（che246/fuckysy/fuvkyc 各两次）、全部再失败。
+//
+// 本用例钉住三件事：
+//  1. 降级重试仍然发生（保留内容指纹误报的自救路径：第 2 次出站 body 为 Degraded 且同账号）；
+//  2. 降级重试后再被拦 → **换到另一个账号**重试并成功（把 400 甩给客户端才是回归）；
+//  3. 两个账号都不被惩罚（渠道校验零动作，账号本身健康）。
+func TestContentBlockedPersistentRotatesToAnotherAccount(t *testing.T) {
+	const body400 = `{"code":11-128,"msg":"Illegal API invocation from an unapproved channel","requestId":"deadbeef"}`
+	var tokens []string // 每次出站的账号令牌（Authorization），用于断言是否换号
+	var bodies [][]byte
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, raw)
+			tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			tokens = append(tokens, tok)
+			// 首个被选中的账号恒定被拦（模拟「坏号」）；其余账号放行。
+			if tok == tokens[0] {
+				return &http.Response{
+					StatusCode: 400,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(body400)),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	// 会话粘性是把「原地重试」做实的那一环：降级分支只 releaseHeld() 不解绑粘性，
+	// 于是重试又粘回同一个坏号（线上 che246/fuckysy/fuvkyc 各两次皆然）。
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"u1", "u2"} },
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, PromptMode: "passthrough"})
+	sess.Bind("conv-1", "u1") // 预绑定坏号，模拟线上粘性会话
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-1"},"messages":[{"role":"system","content":"原始指纹"},{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s（换号重试后应 200，把 400 甩给客户端是回归）", rec.Code, rec.Body)
+	}
+	if len(tokens) < 3 {
+		t.Fatalf("want >=3 upstream calls（原请求 + 降级重试 + 换号重试），got %d: %v", len(tokens), tokens)
+	}
+	// 前两次都粘在坏号 u1：内容指纹误报的自救路径必须保留（同号 + Degraded 提示词）。
+	if tokens[0] != "at1" || tokens[1] != "at1" {
+		t.Errorf("first two attempts should stick to u1: %v", tokens)
+	}
+	if !strings.Contains(string(bodies[1]), prompt.Degraded) {
+		t.Errorf("2nd body should be Degraded: %s", bodies[1])
+	}
+	// 第三次必须换到 u2（关键：不 delete(tried) + fail() 解绑粘性）。
+	if tokens[2] != "at2" {
+		t.Errorf("3rd attempt must rotate to the other account, got %v", tokens)
+	}
+	// 两个账号都不被惩罚（渠道校验零动作）。
+	for _, uid := range []string{"u1", "u2"} {
+		stt, ok := p.Status(uid)
+		if !ok {
+			t.Fatalf("account %s missing from pool", uid)
+		}
+		if stt.Disabled || stt.Cooling || stt.BreakerFails > 0 {
+			t.Errorf("account %s should not be penalized: disabled=%v cooling=%v breaker=%d",
+				uid, stt.Disabled, stt.Cooling, stt.BreakerFails)
+		}
+	}
+}
+
 // TestContentBlockedStickyDegraded 降级后新请求直达 Degraded（不再先撞 400）。
 func TestContentBlockedStickyDegraded(t *testing.T) {
 	var firstCall bool

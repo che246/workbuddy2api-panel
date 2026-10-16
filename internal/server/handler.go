@@ -687,6 +687,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带
 	// 指纹原文重试是确定性再撞墙，replace 是一次性最小抢救（issue #129 设计 §4）。
 	degradedApplied := false
+	// channelRotated 渠道校验换号重试是否已用（见下方「降级重试后仍被拦」分支）。
+	channelRotated := false
 	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
 		body = prompt.Rewrite(body, h.cfg.PromptText)
 	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active() {
@@ -872,6 +874,30 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
 				releaseHeld()
 				log.Printf("content-blocked (likely fingerprint false positive) -> degraded prompt retry")
+				continue
+			}
+			// 降级重试后**仍被拦** → 不是内容问题，是渠道校验，换号重试。
+			//
+			// 判据：降级分支已把 system/developer 整条替换成中性提示词（prompt.Rewrite），
+			// 内容指纹已不复存在，再撞同一个码说明触发点不在提示词里。code 11-128 的旧措辞
+			// "Illegal API invocation from an unapproved channel" 与内容策略文案共用同一个码，
+			// 被 contentBlockedMarkers 先命中归为 ErrContentBlocked（见 upstream.Classify），
+			// 但它描述的是渠道校验（displayTips: "not sent from an official client"）。
+			//
+			// 线上实测依据（2026-10-16）：同一次请求内**换号就能过**——
+			//   22:58:04 fucai18899 200 ｜ 22:58:22 che246 400 ｜ 22:58:50 fucssw 200
+			// 三次请求上下文规模相同（约 22 万 token），差异只在账号。而原地重试必然再撞：
+			// 线上三次降级重试全部落在**同一个**账号上（che246/fuckysy/fuvkyc 各两次）、
+			// 全部再失败——因为坏号是账号侧状态问题，与提示词无关。
+			//
+			// 处置按渠道校验：不罚账号（applyErrorPolicy 的 ErrChannelCheck 分支零动作）。
+			// 关键在**不** delete(tried, uid)（上方降级分支才 delete）：保留 tried 标记
+			// 才能确保下一轮换到**别的**账号；fail() 同时解绑粘性号，避免又粘回坏号。
+			if kind == upstream.ErrContentBlocked && degradedApplied && !channelRotated {
+				channelRotated = true
+				log.Printf("content-blocked persisted after degraded retry -> channel check, rotating account (acct=%s)", acct.UID)
+				h.applyErrorPolicy(acct.UID, upstream.ErrChannelCheck, string(respBody), bareModel, uerr)
+				fail(acct.UID)
 				continue
 			}
 			if kind == upstream.ErrContentBlocked {
