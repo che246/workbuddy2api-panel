@@ -117,6 +117,73 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+// TestClassifyChannelCheck1128 回归（2026-10-16 线上事故）：上游抽样渠道校验的
+// code 11-128 会复用账号级 marker 的措辞——线上实测 msg="request illegal"（与
+// 11140 账号封禁**完全同措辞**）。
+//
+// 修复前：Classify 先走 accountFaultMarkers 命中 "request illegal" → ErrAccountFault
+// → handler 见该措辞直接 Pool.Disable（硬禁用 + 需重登），把只是被抽样拦了一次的
+// 健康账号永久踢出池子。修复后按 code 分流为 ErrChannelCheck（不罚账号、换号重试）。
+//
+// 同时钉住两条**不得回归**的既有语义：
+//   - 11-128 带内容策略旧措辞 → 仍是 ErrContentBlocked（降级重试，零回归）；
+//   - 11140 + "request illegal"（无 11-128 code）→ 仍是 ErrAccountFault（真封禁）。
+func TestClassifyChannelCheck1128(t *testing.T) {
+	// 线上原始 body（已脱敏 requestId）。
+	const prodBody = `{"code":11-128,"msg":"request illegal",` +
+		`"requestId":"f25de6d0c1fc1ea1ab472c53e1d66d68",` +
+		`"displayMsg":{"en":"Request blocked. Please send it again","zh":"请求被拦截，请重新发送",` +
+		`"zh-hant":"請求已被攔截，請重新傳送"},` +
+		`"displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client.",` +
+		`"zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。"}}`
+
+	// issue #380 的另一个变体：msg 换成 conversation id missing。
+	const convIDMissing = `{"code":11-128,"msg":"conversation id missing",` +
+		`"requestId":"645991bb7d2345598f345fe49b4ffc4c",` +
+		`"displayMsg":{"zh":"请求被拦截，请重新发送"},` +
+		`"displayTips":{"zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。"}}`
+
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   ErrKind
+	}{
+		// 本次修复点：11-128 渠道校验族绝不判 account_fault（否则健康账号被 Disable）。
+		{"线上 request illegal 变体", 400, prodBody, ErrChannelCheck},
+		{"conversation id missing 变体", 400, convIDMissing, ErrChannelCheck},
+		{"11-128 无 displayMsg", 400, `{"code":11-128,"msg":"request illegal"}`, ErrChannelCheck},
+		{"11-128 数字 code 形态", 400, `{"code":11-128,"msg":"conversation id missing"}`, ErrChannelCheck},
+		{"11-128 嵌套信封", 400, `{"error":{"data":{"code":"11-128","msg":"request illegal"}}}`, ErrChannelCheck},
+		{"11-128 裸 msg（无 code）不误伤", 400, `{"msg":"request illegal"}`, ErrAccountFault},
+
+		// 零回归：内容策略旧措辞仍是 ErrContentBlocked（走降级重试）。
+		{"旧措辞 unapproved channel", 400, `{"code":11-128,"msg":"Illegal API invocation from an unapproved channel"}`, ErrContentBlocked},
+		{"旧措辞 blocked by security policy", 403, `{"code":11-128,"msg":"blocked by security policy"}`, ErrContentBlocked},
+
+		// 零回归：真账号封禁（11140）仍是 ErrAccountFault。
+		{"11140 真封禁", 429, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, ErrAccountFault},
+		{"14017 试用未激活", 429, `{"code":14017,"msg":"trial not activated"}`, ErrAccountFault},
+	}
+	for _, c := range cases {
+		if got := Classify(c.status, c.body); got != c.want {
+			t.Errorf("%s: Classify(%d)=%v want %v", c.name, c.status, got, c.want)
+		}
+	}
+
+	// 二次保险用的导出版判定：线上 body 必须被识别出 11-128。
+	// 注意上游发的是**非严格 JSON**（`"code":11-128`），只能用字面量匹配。
+	if !HasChannelCheckCode(prodBody) {
+		t.Error("HasChannelCheckCode 未识别线上 body 的 11-128（handler 的 Disable 守卫会失效）")
+	}
+	if !HasChannelCheckCode(`{"code":"11-128","msg":"x"}`) {
+		t.Error("HasChannelCheckCode 未识别字符串形态 code")
+	}
+	if HasChannelCheckCode(`{"code":11140,"msg":"request illegal"}`) {
+		t.Error("HasChannelCheckCode 把 11140 误判为 11-128")
+	}
+}
+
 // TestIsModelRateLimit 判断 429 body 是否明确指向模型级限流（code 6004）。
 func TestIsModelRateLimit(t *testing.T) {
 	cases := []struct {

@@ -42,6 +42,7 @@ const (
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
+	ErrChannelCheck                  // 上游抽样渠道校验（code 11-128 且非内容策略文案）→ 请求级拦截：不罚账号、换号重试
 )
 
 func (k ErrKind) String() string {
@@ -72,6 +73,8 @@ func (k ErrKind) String() string {
 		return "account_fault"
 	case ErrClient:
 		return "client"
+	case ErrChannelCheck:
+		return "channel_check"
 	default:
 		return "none"
 	}
@@ -324,6 +327,21 @@ func hasBusinessCode(body, want string) bool {
 	return walk(root)
 }
 
+// channelCheckCode 上游「请求级拦截」族业务码（渠道校验 / 安全策略）。
+const channelCheckCode = "11-128"
+
+// HasChannelCheckCode 报告错误 body 是否带 11-128 渠道校验码。
+//
+// **为什么不能用 hasBusinessCode**：上游把该码发成非严格 JSON 形态
+// （`{"code":11-128,...}`——`11-128` 不是合法 JSON 数字），encoding/json 解析
+// 直接失败，结构化遍历恒返回 false。只能用字面量匹配（codeMarker 口径，容忍
+// `"code":11-128` / `"code":"11-128"` / 带空白等形态）。
+//
+// 导出供 server 侧对破坏性动作（Pool.Disable）做二次保险。
+func HasChannelCheckCode(body string) bool {
+	return codeMarker(strings.ToLower(body), channelCheckCode)
+}
+
 // hasBusinessEnvelope 报告错误 body 是否携带上游业务信封形态（JSON 且含
 // `"code":` 或 `"msg":` 字段）。WAF 403 判定（IsWafBlocked）用「无业务信封」
 // 区分 APISIX WAF 拦截页（HTML/空体/纯文本）与上游业务层 403（带 code/msg
@@ -506,6 +524,25 @@ func Classify(status int, body string) ErrKind {
 		if strings.Contains(body, m) {
 			return ErrSessionDead
 		}
+	}
+	// code 11-128 = 上游「请求级拦截」族（渠道校验 / 安全策略）：**code 是权威信号**，
+	// 必须在 accountFaultMarkers 之前分流。原因：该族的 msg 措辞会与账号级 marker
+	// 撞车——2026-10-16 线上实测上游新变体用 msg="request illegal"（与 11140 账号
+	// 封禁完全同措辞）配 displayTips「可能不是官方客户端发出的」，若先走
+	// accountFaultMarkers 会判 ErrAccountFault，而 handler 见 "request illegal" 直接
+	// 执行 Pool.Disable（硬禁用 + 需重登）——把一个只是被抽样拦了一次的健康账号
+	// 永久踢出池子。账号本身没问题：同一账号换个时间重发即通过（抽样率约 0.05%）。
+	//   - 命中内容策略文案（旧措辞：blocked by security policy / unapproved channel /
+	//     illegal api invocation）→ 保持既有 ErrContentBlocked 语义（零回归）；
+	//   - 其余（渠道校验措辞：conversation id missing / request illegal）→
+	//     ErrChannelCheck：请求级拦截，不罚账号、换号重试。
+	if HasChannelCheckCode(body) {
+		for _, m := range contentBlockedMarkers {
+			if strings.Contains(lower, m) {
+				return ErrContentBlocked
+			}
+		}
+		return ErrChannelCheck
 	}
 	for _, m := range accountFaultMarkers {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {

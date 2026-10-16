@@ -1481,6 +1481,67 @@ func TestContentBlockedDoesNotPenalizeAccount(t *testing.T) {
 	}
 }
 
+// TestChannelCheckDoesNotDisableAccount 回归（2026-10-16 线上事故）：上游抽样渠道
+// 校验返回 400 code 11-128 + msg "request illegal"——与 11140 账号封禁**完全同措辞**。
+//
+// 修复前：Classify 先命中 accountFaultMarkers 的 "request illegal" → ErrAccountFault
+// → applyErrorPolicy 见该措辞直接 Pool.Disable（硬禁用，需重登），把只是被抽样拦了
+// 一次的健康账号永久踢出池子。线上日志形态：
+//
+//	WARN: [upstream] chat_stream acct=xxx: upstream 400 account_fault
+//	      body={"code":11-128,"msg":"request illegal",...}
+//
+// 本用例走完整链路（Classify → applyErrorPolicy），断言账号**不被禁用**、不冷却、
+// 不计错误数——这才是「健康账号被误杀」的直接回归守卫。
+func TestChannelCheckDoesNotDisableAccount(t *testing.T) {
+	const prodBody = `{"code":11-128,"msg":"request illegal",` +
+		`"requestId":"f25de6d0c1fc1ea1ab472c53e1d66d68",` +
+		`"displayMsg":{"zh":"请求被拦截，请重新发送"},` +
+		`"displayTips":{"zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。"}}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 400, prodBody, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	// 熔断阈值 1：任何一次 NoteError 都会立刻熔断，用来抓「误罚」。
+	p.SetBreaker(1, time.Hour, time.Hour)
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+
+	st, _ := p.Status("u1")
+	if st.Disabled {
+		t.Fatalf("11-128 渠道校验不得禁用账号（修复前 bug）: disabled_reason=%q", st.DisabledReason)
+	}
+	if st.Cooling || st.ErrTotal != 0 {
+		t.Fatalf("11-128 渠道校验不罚账号（不冷却/不计数）: %+v", st)
+	}
+	// 单账号池：轮转无号可换，末端应回落错误透传（不是 200，也不是把号踢掉）。
+	if rec.Code == http.StatusOK {
+		t.Errorf("单账号 + 渠道校验不应返回 200: code=%d", rec.Code)
+	}
+}
+
+// TestAccountFaultStillDisablesOn11140 零回归：真正的 11140 账号封禁仍必须禁用账号
+// （本次修复把 11-128 从 account_fault 分流出去，不能顺手把真封禁也放过）。
+func TestAccountFaultStillDisablesOn11140(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 429, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+
+	st, _ := p.Status("u1")
+	if !st.Disabled {
+		t.Fatalf("11140 真封禁必须禁用账号（零回归）: %+v", st)
+	}
+}
+
 // TestCustomModeFingerprintSanitizePreserved custom 端到端：user 消息含 Claude Code
 // 指纹句（PR39 fixture 串）→ Rewrite 注入自有 system → 经 sanitize → 出站 body 中
 // 该指纹被改写、system 为自有提示词。证明两层（提示词替换 + 清洗）叠加工作。

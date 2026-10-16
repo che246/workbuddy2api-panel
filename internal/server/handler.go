@@ -1388,11 +1388,31 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		//   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
 		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
 		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
-		if strings.Contains(strings.ToLower(body), "request illegal") {
+		//
+		// 二次保险：code 11-128 是上游「请求级拦截」族（渠道校验 / 安全策略），它的
+		// msg 会复用 "request illegal" 这一措辞（2026-10-16 线上实测）。Disable 是
+		// 破坏性且不可自愈的动作（需重登），故此处再挡一层——Classify 已把 11-128
+		// 分流到 ErrChannelCheck，本守卫防的是将来分类规则被改动后误禁用健康账号。
+		if strings.Contains(strings.ToLower(body), "request illegal") &&
+			!upstream.HasChannelCheckCode(body) {
 			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
 			return
 		}
+		if upstream.HasChannelCheckCode(body) {
+			// 11-128 落到本分支（分类规则被改动的防御路径）：按渠道校验处理，不罚账号。
+			log.Printf("WARN: [server] 11-128 channel check reached account_fault branch (acct=%s): not penalizing", uid)
+			return
+		}
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (14017)")
+	case upstream.ErrChannelCheck:
+		// 上游抽样渠道校验（code 11-128 的非内容策略变体，msg 如
+		// "conversation id missing" / "request illegal"）：请求级拦截，**账号本身健康**
+		// ——同一账号换个时间重发即通过（抽样率约 0.05%）。
+		// 零动作：不冷却 / 不熔断 / 不 NoteError / 不 NoteFailures，更不能 Disable。
+		// 轮转由 chatCompletions 的 default 路径处理（换号 = 新请求 = 重新抽样，大概率通过）。
+		//
+		// 与 ErrContentBlocked 的区别：那是「内容/提示词指纹被审核误杀」，靠降级重写
+		// 提示词自救；渠道校验与请求内容无关，重写提示词无用，换号重试才有意义。
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
