@@ -1893,3 +1893,91 @@ func TestChatMarkupRepairStrictModeRejectsUndeclaredTool(t *testing.T) {
 		t.Fatalf("未声明的工具名不得转换: %#v", msg["tool_calls"])
 	}
 }
+
+// TestConversationHeaderStrategyEndToEnd 端到端钉住两个会话 id 的**分工**
+// （2026-10-16 定案，走真实 handler → ChatStream 链路，抓出站头）：
+//
+//   - X-Conversation-ID：每次出站**现生成**（两次请求必须不同）；
+//   - X-Conversation-Request-ID / X-Root-Request-ID：**轮内复用**——同一条 user
+//     消息（同一个「轮」）的两次请求必须同值，上游后台据此把一次 user send 聚合成
+//     一条记录（issue #35 语义）；
+//   - prompt_cache_key：仍按会话稳定（P0 费用优化，与出站头解耦）。
+func TestConversationHeaderStrategyEndToEnd(t *testing.T) {
+	type captured struct {
+		convID   string
+		turnID   string
+		rootID   string
+		msgID    string
+		cacheKey string
+	}
+	var mu sync.Mutex
+	var got []captured
+
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			var obj map[string]any
+			_ = json.Unmarshal(raw, &obj)
+			ck, _ := obj["prompt_cache_key"].(string)
+			mu.Lock()
+			got = append(got, captured{
+				convID:   r.Header.Get("X-Conversation-ID"),
+				turnID:   r.Header.Get("X-Conversation-Request-ID"),
+				rootID:   r.Header.Get("X-Root-Request-ID"),
+				msgID:    r.Header.Get("X-Conversation-Message-ID"),
+				cacheKey: ck,
+			})
+			mu.Unlock()
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+
+	// 同一条 user 消息 = 同一个「轮」。
+	reqBody := `{"model":"glm-5.2","messages":[{"role":"user","content":"同一个问题"}],"stream":true}`
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(reqBody)))
+		if rec.Code != 200 {
+			t.Fatalf("第 %d 次请求 code=%d body=%s", i+1, rec.Code, rec.Body.String())
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("出站次数=%d want 2", len(got))
+	}
+
+	// 轮级 id：轮内复用（同值），且 Root == Conversation-Request。
+	if got[0].turnID != got[1].turnID {
+		t.Errorf("同一轮的 X-Conversation-Request-ID 必须复用同值（issue #35 聚合）: %q != %q",
+			got[0].turnID, got[1].turnID)
+	}
+	if got[0].turnID == "" {
+		t.Error("X-Conversation-Request-ID 不得为空")
+	}
+	for i, c := range got {
+		if c.rootID != c.turnID {
+			t.Errorf("第 %d 次 X-Root-Request-ID 应等于 X-Conversation-Request-ID: %q vs %q", i+1, c.rootID, c.turnID)
+		}
+	}
+	// 会话 id：每次现生成（不同）。
+	if got[0].convID == got[1].convID {
+		t.Errorf("X-Conversation-ID 应每次现生成: %q", got[0].convID)
+	}
+	// 消息级 id：每次出站都新生成。
+	if got[0].msgID == got[1].msgID {
+		t.Errorf("X-Conversation-Message-ID 应每次新生成: %q", got[0].msgID)
+	}
+	// 前缀缓存键：同一会话稳定（与出站头解耦的关键）。
+	if got[0].cacheKey == "" || got[0].cacheKey != got[1].cacheKey {
+		t.Errorf("prompt_cache_key 必须按会话稳定: %q vs %q", got[0].cacheKey, got[1].cacheKey)
+	}
+}

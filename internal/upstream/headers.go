@@ -115,26 +115,40 @@ func (c *Client) injectDeviceToken(req *http.Request, a *auth.Auth) {
 	}
 }
 
-// deriveAccountStableID 按 uid + 用途盐稳定派生 36 hex 设备/会话标识。
-// 跨重启稳定（固定盐 "wb2a:"，不随进程换——这是与 session 包派生盐的本质差异：
-// 那是会话键维度的进程级随机盐，重启换新；本函数是账号维度，必须跨重启恒定）、
-// 账号间互异（uid 不同则不同）、同 uid 同用途恒同值（幂等）。用 sha256 与项目
-// 既有派生（session/ids.go、cache_key.go）保持一致；截 36 hex 提供更长熵。
+// deriveAccountStableID 按 uid + 用途盐稳定派生**带连字符的 UUID 形态**设备/会话标识。
+//
+// 形态对齐官方客户端（5.8.4 抓包）：machineId / sessionId 都是带连字符的 UUID
+// （36 字符，8-4-4-4-12）。此前本函数输出 36 位无连字符 hex，形态对不上——那本身
+// 就是一处「网关特征」。版本位固定 4、变体位固定 10（UUIDv4 形态；上游不校验版本号，
+// 形态贴近即可）。
+//
+// 取值范围不能照抄官方：官方客户端是「一个进程 = 一台设备」，而网关是一个长驻进程
+// 同时冒充几十台设备——按进程维度取一次值，等于让全部账号共用同一个 session id，
+// 那是一条把它们串起来的关联键，与「每账号一台设备」的隔离口径自相矛盾。
+// 故必须按账号派生：跨重启稳定（固定盐 "wb2a:"，不随进程换——这是与 session 包
+// 派生盐的本质差异：那是会话键维度的进程级随机盐，重启换新；本函数是账号维度，
+// 必须跨重启恒定）、账号间互异（uid 不同则不同）、同 uid 同用途恒同值（幂等）。
 //
 // 两个用途：
 //   - purpose="machine" → X-Machine-ID（设备级，跨会话稳定）
 //   - purpose="session" → X-Session-ID（账号固定会话，跨重启稳定）
 //
 // 与 injectDeviceToken 的 X-Device-Token 并存不冲突：那是登录时上游签发的
-// 真实设备令牌（有则发，权威）；本对头是「每账号一台固定虚拟设备」的稳定指纹，
-// 防多号被上游按设备指纹缺失/漂移关联风控。两者是不同头族，官方桌面端都发。
+// 真实设备令牌（有则发，权威）；本对头是「每账号一台固定虚拟设备」的稳定指纹。
 func deriveAccountStableID(uid, purpose string) string {
 	sum := sha256.Sum256([]byte("wb2a:" + purpose + ":" + uid))
-	return hex.EncodeToString(sum[:18]) // 36 hex chars
+	h := hex.EncodeToString(sum[:16]) // 32 hex
+	h = h[:12] + "4" + h[13:16] + "8" + h[17:]
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
 }
 
 // injectAccountStableHeaders 在 req 注入 X-Machine-ID / X-Session-ID：按 uid 稳定
-// 派生，跨重启固定、账号间互异。uid 为空时不注入（匿名请求无设备标识，上游不要求）。
+// 派生（带连字符 UUID 形态，见 deriveAccountStableID），跨重启固定、账号间互异。
+// uid 为空时不注入（匿名请求无设备标识，上游不要求）。
+//
+// **只在反馈/计费类出站注入，不在 chat 注入**：5.8.4 抓包实测官方对话请求不带这两个
+// 头（它们只用于反馈上报），带上「每账号恒定」的派生值反而是一处网关特征。
+// 此前注入点在 CommonHeaders（chat 天然继承）——已剥离，见 CommonHeaders 注释。
 func (c *Client) injectAccountStableHeaders(req *http.Request, a *auth.Auth) {
 	if a == nil || a.UID == "" {
 		return
@@ -144,6 +158,10 @@ func (c *Client) injectAccountStableHeaders(req *http.Request, a *auth.Auth) {
 }
 
 // CommonHeaders 设置所有 API 共享的请求头。
+//
+// 注意**不含** X-Machine-ID / X-Session-ID：官方对话请求不带这两个头（5.8.4 抓包），
+// 需要它们的反馈/计费类出站各自显式调 injectAccountStableHeaders
+// （BillingHeaders / RefreshHeaders / FetchModels / fetchEnterpriseModels）。
 func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Content-Type", "application/json")
 	// Accept 非流式默认 application/json（D6：去掉宽松的 text/plain, */*）。
@@ -159,10 +177,6 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	// Accept-Language 按 realm 切（D5）：CN zh-CN，global en-US。官方客户端按账号域
 	// 发对应语言标识，对齐避免上游风控按语言缺失误判。
 	req.Header.Set("Accept-Language", acceptLanguageFor(a))
-	// X-Machine-ID / X-Session-ID：按 uid 稳定派生的账号级设备头（见
-	// injectAccountStableHeaders）。注入在 CommonHeaders——chat 经 ChatHeaders
-	// 叠加 CommonHeaders 天然继承；billing 域另行注入，全出站覆盖。
-	c.injectAccountStableHeaders(req, a)
 }
 
 // acceptLanguageFor 按账号 realm 返回 Accept-Language：global → en-US，cn → zh-CN。
@@ -179,15 +193,32 @@ func (c *Client) injectCodeBuddyRequest(req *http.Request) {
 	req.Header.Set("X-CodeBuddy-Request", "1")
 }
 
-// ChatMeta 一次 chat 出站的会话头族元数据（issue #35：后台按 X-Conversation-Request-ID
-// 聚合请求，官方客户端一次 user send 内所有 tool call/重试/换号复用同一个 ID）。
-// handler 在轮转循环外生成 conversationID / conversationRequestID，循环内每次出站
-// 复用同值；TraceID 透传入站值（空 = 回落 conversationRequestID）。
-// messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
+// ChatMeta 一次 chat 出站的会话头族元数据。
+//
+// 两个 id 走**不同策略**（2026-10-16 定案）：
+//
+//   - X-Conversation-ID：**每次出站现生成**（带连字符 UUID）。不再回落网关会话键
+//     ——`d-<hex>` 那种形态与来源本身就是网关特征。客户端显式给了就透传。
+//   - X-Conversation-Request-ID / X-Root-Request-ID：**轮内复用**（issue #35）。
+//     按 body 最后一条 user 消息派生，一次 user send 内的所有出站（tool call /
+//     换号重试 / 降级重发）复用同值，上游后台据此把一次 user send 聚合成一条
+//     记录。客户端显式给了就透传；无轮级键时留空，由 injectConversationHeaders
+//     现生成（退化成本次请求级随机）。
 type ChatMeta struct {
-	ConversationID        string // X-Conversation-ID：body 提取的入站值，空则不发（透传优先，不伪造）
-	ConversationRequestID string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发
-	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
+	// ConversationID 客户端显式给的会话 id（body 提取）。空 = 客户端没给 →
+	// 现生成一个带连字符的 UUID（不再回落网关会话键）。
+	ConversationID string
+	// ConversationRequestID 轮级 id：handler 按轮键派生后传入（轮内复用）；
+	// 客户端显式透传优先。空 = 无轮级键 → injectConversationHeaders 现生成 32 hex。
+	ConversationRequestID string
+	// TraceID X-Trace-ID：入站透传值，空则回落本次生成的请求 id。
+	TraceID string
+	// CacheKeySeed 前缀缓存键（prompt_cache_key）的会话哈希源，**与出站头解耦**。
+	//
+	// 出站头按上面策略走，但缓存键必须**按会话稳定**：否则同一会话的连续请求
+	// 会各用一个新键，上游前缀缓存永不命中——那是 P0 费用优化（命中时费用降约
+	// 17×，见 cache_key.go）。handler 传会话键（或客户端显式会话 id）。
+	CacheKeySeed string
 }
 
 // ChatHeaders 在 common 之上加 chat 专属的账号头。
@@ -254,29 +285,37 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("X-Domain", "www.workbuddy.ai")
 }
 
-// injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合）。
-// 头族分四层，各司其职：
-//   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。空则不发——
-//     透传客户端原值优先，客户端没给就不伪造，避免误导后台建错会话。
-//   - X-Conversation-Request-ID：**对话轮级聚合主键**，必发。一次 user send 内的
-//     所有 tool call/重试/换号/降级复用同一个 → 后台按它聚合成一条（不再碎片化）。
-//   - X-Conversation-Message-ID = X-Request-ID：消息级，每条独立（32 位 hex）。
+// injectConversationHeaders 注入官方客户端会话头族。
+//
+// 取值策略：客户端显式给的透传；没给的——会话 id **每次现生成**，轮级 id 由
+// handler 按轮键派生后传入（**轮内复用**，见 ChatMeta）。形态对齐 5.8.4 抓包：
+// 会话 id 是带连字符的 UUID，请求/消息 id 是 32 位 hex。
+//   - X-Conversation-ID：会话级。客户端给了就透传（真实客户端在同一对话内稳定
+//     复用），没给则现生成 UUID——此前回落网关会话键（`d-<hex>`），形态与来源
+//     都是网关特征。
+//   - X-Conversation-Request-ID：轮级。handler 传入轮键派生值（轮内复用）；
+//     空（客户端没给且无轮级键）则现生成 32 hex。
+//   - X-Conversation-Message-ID = X-Request-ID：消息级，每条独立（32 位 hex，
+//     **每次出站都新生成**——这一层不复用）。
 //   - X-Root-Request-ID：= conversationRequestID（根请求追踪）。
 //   - X-Trace-ID：入站透传或 = conversationRequestID。
 //   - X-B3-TraceId / X-B3-SpanId / X-B3-Sampled：链路族。B3 规范只认 16/32 hex
-//     TraceId 与 16 hex SpanId；入站 conversationRequestID 非法时 TraceId 回落
-//     messageID（恒 32 hex），SpanId 取 messageID[:16]（每消息新）。
+//     TraceId 与 16 hex SpanId；入站透传值非法时 TraceId 回落恒 32 hex 的
+//     messageID，SpanId 取 messageID[:16]（每消息新）。
 func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
+	convID := meta.ConversationID
+	if convID == "" {
+		// 客户端没给会话 id：现生成带连字符的 UUID（不再回落网关会话键）。
+		convID = session.NewConversationID()
+	}
 	convReqID := meta.ConversationRequestID
 	if convReqID == "" {
-		// 零值 meta（直接调 ChatHeaders 的调用方/测试）也要保证聚合主键必发：
-		// 本级补一个 32 hex，调用方（handler）已生成稳定的不走到这里。
+		// 无轮级键（客户端没给、handler 也没派生出来）：现生成 32 hex，
+		// 退化成本次请求级随机——轮内复用的前提是存在轮级键。
 		convReqID = session.NewMessageID()
 	}
 	messageID := session.NewMessageID()
-	if meta.ConversationID != "" {
-		req.Header.Set("X-Conversation-ID", meta.ConversationID)
-	}
+	req.Header.Set("X-Conversation-ID", convID)
 	req.Header.Set("X-Conversation-Request-ID", convReqID)
 	req.Header.Set("X-Conversation-Message-ID", messageID)
 	req.Header.Set("X-Request-ID", messageID)
@@ -397,11 +436,18 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	}
 	// 设备风控头：billing 域（report/travel/balance/checkin）同样注入。
 	c.injectDeviceToken(req, a)
+	// X-Machine-ID / X-Session-ID：官方客户端在**反馈上报类**请求带这两个头
+	// （5.8.4 抓包），故 billing 域注入；两个都按账号派生（每账号一台虚拟设备，
+	// 取进程级值会让全池共用同一 session id、反而成为关联键）。
+	// 注意与 chat 的分野：对话请求不带这两个头（见 injectAccountStableHeaders）。
+	c.injectAccountStableHeaders(req, a)
 }
 
 // RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。
 func (c *Client) RefreshHeaders(req *http.Request, a *auth.Auth) {
 	c.CommonHeaders(req, a)
+	// refresh 属账号维护类出站（非对话），保留设备头（剥离 CommonHeaders 前的行为）。
+	c.injectAccountStableHeaders(req, a)
 	req.Header.Set("X-Refresh-Token", a.RefreshToken)
 	if a.EnterpriseID != "" {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)

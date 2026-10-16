@@ -51,6 +51,18 @@ func main() {
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
 	flag.Parse()
 
+	// 日志环提前建、镜像提前装（必须在任何 log.Printf 之前）：
+	// 面板「运行日志」视图要能看到**启动期**日志——配置生成、账号加载、排程启用
+	// 这些行都早于 panel.New（面板依赖 pool/upstream/scheduler 装配完成，构造在
+	// main 后段）。此前镜像在面板构造之后才装，启动阶段十几行日志从没进过环，
+	// 视图里只能看到「listening on」之后的行。
+	// 环容量与面板默认一致（500 行），经 panel.Config.LogRing 交给面板复用同一环。
+	logRing := panel.NewRing(500)
+	log.SetOutput(io.MultiWriter(os.Stderr, logRing))
+	// chat 表格日志同样提前镜像：该 writer 只在开始服务后才被写入（chat 行由请求
+	// 处理产生），提前装无副作用，且与上面的 log 镜像共用同一个环。
+	server.SetChatLogOutput(io.MultiWriter(os.Stdout, logRing))
+
 	cfg, err := Load(*cfgPath)
 	if err != nil {
 		// errors.Is 才能看穿 Load 里 fmt.Errorf("%w") 的包装；os.IsNotExist 不行。
@@ -274,6 +286,8 @@ func main() {
 		StickyCount: sessCount,
 		Version:     appVersion,
 		Live:        live,
+		// 复用 main 开头预建的日志环（含启动期日志），见 main 顶部注释。
+		LogRing: logRing,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
@@ -288,8 +302,8 @@ func main() {
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
 	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
 	sch.SetGrowthHook(pn.RunGrowthQueueOnce)
-	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
-	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
+	// log / chat 日志的镜像已在 main 开头装上（见那里的注释），此处不再重装：
+	// 面板复用同一个 logRing（panel.Config.LogRing），启动期日志也在环内。
 
 	h := server.NewHandler(server.Config{
 		Pool:         p,

@@ -821,7 +821,9 @@ func (c *Client) chatBase(a *auth.Auth) string {
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
-func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
+// cacheKeySeed 为 prompt_cache_key 的会话哈希源（会话级稳定；见 ChatMeta.CacheKeySeed
+// ——它与出站会话头族解耦，后者已改为每次出站现生成）。
+func (c *Client) prepareBody(body []byte, realm, uid, cacheKeySeed string) []byte {
 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
 	if realmKey(realm) == "global" {
 		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（全局 21 名内档位如
@@ -832,7 +834,7 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints.Load(), efforts, defs)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
-	body = InjectPromptCacheKey(body, uid, conversationID)
+	body = InjectPromptCacheKey(body, uid, cacheKeySeed)
 	return body
 }
 
@@ -1056,7 +1058,10 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
+	// 前缀缓存键用 CacheKeySeed（会话级稳定），**不是** meta.ConversationID——
+	// 后者已改为每次出站现生成（见 ChatMeta），拿它做缓存键会让同一会话的连续
+	// 请求各用一个新键、上游前缀缓存永不命中（P0 费用优化）。
+	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.CacheKeySeed)
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
@@ -1361,6 +1366,8 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, err
 	}
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
+	// 模型目录拉取属账号维护类出站（非对话），保留设备头（剥离 CommonHeaders 前的行为）。
+	c.injectAccountStableHeaders(req, a)
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	resp, err := c.HTTP.Do(req)

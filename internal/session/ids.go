@@ -56,6 +56,30 @@ func NewMessageID() string {
 	return fmt.Sprintf("%016x%016x", uint64(rand.Uint64())|1, rand.Uint64())
 }
 
+// NewConversationID 生成会话级 ID：带连字符的 UUID（36 字符，8-4-4-4-12）。
+//
+// 形态对齐官方客户端 X-Conversation-ID（5.8.4 抓包实测：带连字符的 UUID）。
+// 此前网关用会话键派生值当会话 id（形如 `d-<32hex>`），形态对不上，本身就是
+// 一处「网关特征」——改为每次现生成随机 UUID。
+//
+// 版本位固定 4、变体位固定 10（UUIDv4 形态）：上游不校验版本号，形态贴近即可。
+func NewConversationID() string {
+	b := make([]byte, 16)
+	if _, err := cryptorand.Read(b); err == nil {
+		b[6] = (b[6] & 0x0f) | 0x40 // version 4
+		b[8] = (b[8] & 0x3f) | 0x80 // variant 10xx
+		return formatUUID(hex.EncodeToString(b))
+	}
+	// 熵源故障的极端兜底：仍保证合法 UUID 形态（不 panic、不空串）。
+	h := fmt.Sprintf("%016x%016x", uint64(rand.Uint64())|1, rand.Uint64())
+	return formatUUID(h[:12] + "4" + h[13:16] + "8" + h[17:])
+}
+
+// formatUUID 把 32 位 hex 切成 8-4-4-4-12 的带连字符形态。
+func formatUUID(h string) string {
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
 // deriveSalt 进程启动随机盐：对所有稳定聚合 ID 的纯派生统一加盐，使派生值无法
 // 按外部可控的键内容（会话键/轮级键）被预计算；重启换新（重启时旧对话轮/会话已
 // 结束，不构成断档）。会话级（RequestIDForKey）与轮级（TurnRequestID）共用同一盐。

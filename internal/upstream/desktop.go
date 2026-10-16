@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
 const (
@@ -417,7 +418,9 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 // expert_actual_use 等 JOIN 事件的 requestId 必须是该服务端 id——自造 UUID 不计数
 // （客户端 resolveRealRequestId 同款语义，Sunny row 2113 实证）。
 func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversationID, requestID string, err error) {
-	conversationID = fmt.Sprintf("wb2api-conv-%d", time.Now().UnixNano())
+	// 会话 id 用带连字符 UUID（对齐 5.8.4 抓包形态）。此前是 `wb2api-conv-<纳秒>`：
+	// 那个前缀本身就是网关特征，且形态与官方不符。
+	conversationID = session.NewConversationID()
 	body := map[string]any{
 		"model": "fast-model",
 		"messages": []any{
@@ -445,14 +448,17 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	h.Set("X-Domain", c.chatBase(a))
 	h.Set("X-Product", "SaaS")
 	h.Set("X-User-Id", a.UID)
-	h.Set("X-Conversation-ID", conversationID)
-	h.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
 	h.Set("X-Agent-Intent", "craft")
 	h.Set("X-Agent-Type", "main")
 	h.Set("X-IDE-Name", "WorkBuddy")
 	h.Set("X-IDE-Type", "WorkBuddy")
 	h.Set("X-IDE-Version", "5.5.6")
 	h.Set("x-codebuddy-request", "1")
+	// 会话头族走统一实现（与主代理路径同一题源）：X-Conversation-ID 用本轮的
+	// conversationID，请求/消息 id 每次现生成 32 位 hex。此前这里手写
+	// X-Request-ID=十进制纳秒（非官方 32 hex 形态），且缺 -Request-ID/-Message-ID/
+	// X-Root-Request-ID 与链路头族——与 hub #380 的失败画像同型，一并补齐。
+	c.injectConversationHeaders(req, ChatMeta{ConversationID: conversationID})
 	if expertID != "" {
 		h.Set("X-Expert-Id", expertID)
 	}

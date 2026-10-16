@@ -776,7 +776,9 @@ $('logChips').addEventListener('click', ev => {
 });
 async function loadLogs() {
   const box = $('logBox');
-  const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
+  // 日志按时间倒序渲染（最新在最上，与「请求记录」口径一致，见 logsHandler）：
+  // 因此「跟随最新」对应的是贴顶，不是贴底。
+  const atTop = box.scrollTop <= 24;
   const limit = ($('reqLimit') && $('reqLimit').value) || 100;
   // 时间范围由归档侧过滤（不是前端筛已拉取的条目）：区间落在更早的时间段时，
   // 「最近 N 条」里根本不会有那些记录，必须让服务端按时间取。
@@ -803,7 +805,7 @@ async function loadLogs() {
         return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
       }).join('')
       : '<span style="color:var(--ink-3)">暂无日志</span>';
-    if (logPin && atEnd) box.scrollTop = box.scrollHeight;
+    if (logPin && atTop) box.scrollTop = 0;
     const counts = {};
     for (const e of (d.entries || [])) counts[e.ch] = (counts[e.ch] || 0) + 1;
     $('logNote').textContent = logCh === 'all'

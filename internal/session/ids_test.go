@@ -3,6 +3,7 @@ package session
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -59,6 +60,23 @@ func TestNewMessageIDFormat(t *testing.T) {
 				t.Fatalf("NewMessageID() = %q has non-hex char %q", id, ch)
 			}
 		}
+	}
+}
+
+// TestNewConversationIDFormat 带连字符的 UUID 形态（8-4-4-4-12，版本位 4、
+// 变体位 8/9/a/b），且每次调用不同（会话头族改为每请求现生成后的取值来源）。
+func TestNewConversationIDFormat(t *testing.T) {
+	re := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	seen := map[string]bool{}
+	for i := 0; i < 50; i++ {
+		id := NewConversationID()
+		if !re.MatchString(id) {
+			t.Fatalf("NewConversationID() = %q 不是带连字符的 UUIDv4 形态", id)
+		}
+		if seen[id] {
+			t.Fatalf("NewConversationID() 重复值 %q（应每次新生成）", id)
+		}
+		seen[id] = true
 	}
 }
 

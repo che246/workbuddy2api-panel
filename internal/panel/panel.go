@@ -65,6 +65,14 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// LogRing 外部预建的日志环（nil = New 内部自建，容量 500，既有行为）。
+	//
+	// 为什么允许外部传入：面板构造发生在 main 的后段（依赖 pool/upstream/scheduler
+	// 装配完成），而「运行日志」视图需要看到**启动期**日志（配置生成、账号加载、
+	// 排程启用等）。main 因此提前建环并把 log 镜像装上，再经本字段交给面板复用
+	// ——若各建各的环，启动期日志写进 A 环、面板读 B 环，视图里永远看不到。
+	LogRing *Ring
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -132,18 +140,25 @@ func New(cfg Config) *Panel {
 	if cfg.RedisMode == "" {
 		cfg.RedisMode = "noop"
 	}
+	// 日志环优先复用调用方预建的（main 提前建环以覆盖启动期日志，见 Config.LogRing）；
+	// 未提供则自建（测试与嵌入式用法零改动）。
+	logs := cfg.LogRing
+	if logs == nil {
+		logs = NewRing(500)
+	}
 	p := &Panel{
 		cfg:     cfg,
 		mux:     http.NewServeMux(),
 		started: time.Now(),
-		logs:    NewRing(500),
+		logs:    logs,
 		logins:  map[string]loginSession{},
 	}
 	p.routes()
 	return p
 }
 
-// Logs 返回日志环形缓冲（main 经 MultiWriter 镜像 log 与 chat 表格日志进来）。
+// Logs 返回日志环形缓冲。main 在**启动早期**就把 log 包输出与 chat 表格日志经
+// MultiWriter 镜像进来（早于本面板构造，见 Config.LogRing），故启动期日志也在环内。
 func (p *Panel) Logs() *Ring { return p.logs }
 
 func (p *Panel) routes() {
@@ -256,9 +271,19 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
+// logsHandler 返回日志环形缓冲快照，**按时间倒序**（最新在前，含频道标记
+// chat/task/sys）。
+//
+// 倒序在 API 边界做、不动 Ring.Snapshot：Ring 的契约是「按写入顺序返回」，面板
+// 展示口径统一为「最新在前」——归档侧 request_logs 也是按时间倒序返回
+// （reqlog.ReadArchive），前端两个视图都只按接收顺序渲染，不各自排序。
 func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"entries": p.logs.Snapshot()})
+	snap := p.logs.Snapshot()
+	// Snapshot 已返回副本，原地反转不影响 Ring 内部状态。
+	for i, j := 0, len(snap)-1; i < j; i, j = i+1, j-1 {
+		snap[i], snap[j] = snap[j], snap[i]
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": snap})
 }
 
 // requestMetrics 返回进程内请求指标、最近 100 条与归档状态。

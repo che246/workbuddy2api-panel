@@ -571,10 +571,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 轮级聚合键：按 body 里最后一条 user 消息派生（同轮内所有上游调用同键，
-	// 换 user 消息换键）。#170 起带会话键的客户端也统一走轮级（对齐官方桌面 CLI
-	// 的 X-Conversation-Request-ID 轮级语义——TraceStartHook 每次 USER_PROMPT_SUBMIT
-	// 清空重生成），故不再限 sessKey=="" 才计算；sessKey 由下方派生处以复合键方式
-	// 入键（防不同会话同轮文本互撞）。
+	// 换 user 消息换键）。用于 X-Conversation-Request-ID 的**轮内复用**——一次
+	// user send 内的 tool call / 换号重试 / 降级重发复用同一个 id，上游后台据此
+	// 聚合成一条记录（issue #35 语义，2026-10-16 起只保留在轮级 id 上：会话 id
+	// 已改为每次现生成，见下方 ChatMeta 组装）。
 	// 必须在下方 prompt.Rewrite 之前取——改写会动 messages 内容，之后取会让键漂移。
 	turnKey := session.TurnKey(body)
 
@@ -702,42 +702,40 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		body = rewriteModel(body, bareModel)
 	}
 
-	// 会话头族（issue #35）：后台按 X-Conversation-Request-ID（对话轮级）聚合请求，
-	// 官方客户端一次 user send 内所有 tool call/重试/换号复用同一个 ID。此处**轮转
-	// 循环外**生成一次，循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再
-	// 碎片化（此前网关一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个
-	// RequestID）。
-	//   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造）；
-	//   - conversationRequestID：入站 X-Conversation-Request-ID 透传优先，否则按
-	//     粘性 key 进程内稳定生成；粘性 key 也空时走轮级兜底（TurnKey/TurnRequestID），
-	//     无 user 消息时退化成本请求级随机——轮转内捕获一次即共享；
-	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
-	// ConversationID passes the client dialog id through. Clients that have none
-	// (Anthropic / Claude Code traffic) fall back to the session key, otherwise
-	// the upstream prompt_cache_key degrades into one constant per account and
-	// every client on that account ends up sharing a single, constantly evicted
-	// prefix-cache slot.
-	convID := session.ResolveConversationID(body)
-	if convID == "" {
-		convID = sessKey
+	// 会话头族：两个 id 走**不同策略**（2026-10-16 定案）。
+	//
+	//   - X-Conversation-ID：**每次出站现生成**（带连字符 UUID）。客户端显式给了就
+	//     透传（真实客户端在同一对话内复用它）。此前回落网关派生的会话键
+	//     （`d-<hex>`）——那个形态与来源本身就是网关特征，已废弃。
+	//   - X-Conversation-Request-ID / X-Root-Request-ID：**轮内复用**。按 body 最后
+	//     一条 user 消息派生（见上方 turnKey），一次 user send 内的所有出站
+	//     （tool call / 换号重试 / 降级重发）复用同值，上游后台据此把一次 user send
+	//     聚合成一条记录（issue #35 语义保留在轮级 id 上）。客户端显式给了就透传。
+	//     无 user 消息（无轮级键）时留空，由 upstream 侧现生成。
+	//
+	// 前缀缓存键另走 CacheKeySeed：**必须按会话稳定**，否则同一会话的连续请求各用
+	// 一个新键、上游前缀缓存永不命中（P0 费用优化，命中时费用降约 17×，见
+	// cache_key.go）。故它与出站头解耦：客户端给了会话 id 用它，否则回落会话键。
+	clientConvID := session.ResolveConversationID(body)
+	cacheKeySeed := clientConvID
+	if cacheKeySeed == "" {
+		cacheKeySeed = sessKey
 	}
-	chatMeta := upstream.ChatMeta{ConversationID: convID}
-	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
-		chatMeta.ConversationRequestID = v
-	} else if turnKey != "" && sessKey != "" {
-		// 轮级复合键：sessKey 入键防跨会话同轮文本互撞（#170 统一轮级）。
-		chatMeta.ConversationRequestID = session.TurnRequestID(sessKey + ":" + turnKey)
-	} else if turnKey != "" {
-		// 无会话键客户端：纯轮级键（既有兜底语义不变，存量会话键值零漂移）。
-		chatMeta.ConversationRequestID = session.TurnRequestID(turnKey)
-	} else if sessKey != "" {
-		// 残留空态兜底（无 user 消息/无可签名内容）：会话级聚合，好于请求级随机。
-		chatMeta.ConversationRequestID = session.RequestIDForKey(sessKey)
-	} else {
-		// 无会话键也无轮级键：请求级随机（轮转内捕获一次即共享）。
-		chatMeta.ConversationRequestID = session.TurnRequestID("")
+	// 轮级 id：客户端透传优先；否则按轮键派生（sessKey 入键防跨会话同轮文本互撞）。
+	turnReqID := r.Header.Get("X-Conversation-Request-ID")
+	if turnReqID == "" {
+		if turnKey != "" && sessKey != "" {
+			turnReqID = session.TurnRequestID(sessKey + ":" + turnKey)
+		} else if turnKey != "" {
+			turnReqID = session.TurnRequestID(turnKey)
+		}
 	}
-	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
+	chatMeta := upstream.ChatMeta{
+		ConversationID:        clientConvID,
+		ConversationRequestID: turnReqID,
+		TraceID:               r.Header.Get("X-Trace-ID"),
+		CacheKeySeed:          cacheKeySeed,
+	}
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
